@@ -15,6 +15,11 @@ msg_error() { echo -e "  [!] $1" >&2; }
 
 export DEBIAN_FRONTEND=noninteractive
 
+# `runuser -u postgres` tries to re-enter the caller's cwd (/root) as the
+# postgres user, which it can't read - harmless but noisy. /tmp is
+# world-readable, so run from there instead.
+cd /tmp
+
 BASE_IMAGE="docker.io/akaunting/akaunting:latest"
 IMAGE_TAG="akaunting-pgsql:local"
 CONTAINER_NAME="akaunting"
