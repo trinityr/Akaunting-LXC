@@ -15,6 +15,14 @@ msg_error() { echo -e "  [!] $1" >&2; }
 
 export DEBIAN_FRONTEND=noninteractive
 
+# `pct exec` inherits LANG from the Proxmox host (often en_US.UTF-8), but the
+# minimal Debian template never generates that locale, so every apt/dpkg
+# perl script warns and falls back to C. C.UTF-8 is a glibc built-in that
+# needs no locale-gen, so pin to it explicitly instead of fighting the
+# inherited env.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
 # `runuser -u postgres` tries to re-enter the caller's cwd (/root) as the
 # postgres user, which it can't read - harmless but noisy. /tmp is
 # world-readable, so run from there instead.
