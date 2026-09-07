@@ -22,8 +22,15 @@ set -Eeuo pipefail
 #   AKAUNTING_DB_PASSWORD (default: randomly generated)
 #   AKAUNTING_ADMIN_EMAIL, AKAUNTING_ADMIN_PASSWORD (default: generated)
 #   AKAUNTING_COMPANY_NAME, AKAUNTING_COMPANY_EMAIL, AKAUNTING_LOCALE
+#   AKAUNTING_APP_URL (default: http://<container-ip>:<port>, or
+#   https://<AKAUNTING_DOMAIN> if ENABLE_HTTPS=1 - override if an existing
+#   reverse proxy presents a different address to clients)
 #   PG_ALLOWED_CIDR (network allowed to reach Postgres besides the
 #   container's own docker bridge - see README for the security tradeoff)
+#   ENABLE_HTTPS (1/0, default 0 - installs Caddy in the LXC and gets a
+#   Let's Encrypt certificate for AKAUNTING_DOMAIN; needs ports 80/443
+#   reachable from the internet, see README). AKAUNTING_DOMAIN is required
+#   when set. LETSENCRYPT_EMAIL is optional (renewal/expiry notices).
 
 INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/trinityr/Akaunting-LXC/main/install/akaunting-install.sh}"
 
@@ -91,7 +98,11 @@ run_install() {
   local AKAUNTING_COMPANY_NAME="${AKAUNTING_COMPANY_NAME:-My Company}"
   local AKAUNTING_COMPANY_EMAIL="${AKAUNTING_COMPANY_EMAIL:-$AKAUNTING_ADMIN_EMAIL}"
   local AKAUNTING_LOCALE="${AKAUNTING_LOCALE:-en-GB}"
+  local AKAUNTING_APP_URL="${AKAUNTING_APP_URL:-}"
   local PG_ALLOWED_CIDR="${PG_ALLOWED_CIDR:-}"
+  local ENABLE_HTTPS="${ENABLE_HTTPS:-0}"
+  local AKAUNTING_DOMAIN="${AKAUNTING_DOMAIN:-}"
+  local LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 
   if pct status "$CTID" >/dev/null 2>&1; then
     msg_error "Container ID ${CTID} already exists. Set CTID to a free ID or run in update mode."
@@ -164,7 +175,11 @@ run_install() {
     "AKAUNTING_COMPANY_NAME=${AKAUNTING_COMPANY_NAME}" \
     "AKAUNTING_COMPANY_EMAIL=${AKAUNTING_COMPANY_EMAIL}" \
     "AKAUNTING_LOCALE=${AKAUNTING_LOCALE}" \
+    "AKAUNTING_APP_URL=${AKAUNTING_APP_URL}" \
     "PG_ALLOWED_CIDR=${PG_ALLOWED_CIDR}" \
+    "ENABLE_HTTPS=${ENABLE_HTTPS}" \
+    "AKAUNTING_DOMAIN=${AKAUNTING_DOMAIN}" \
+    "LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}" \
     bash -c "$INSTALL_SCRIPT_CONTENT"
   msg_ok "Installed Akaunting"
 

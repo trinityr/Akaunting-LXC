@@ -45,7 +45,11 @@ Available variables:
 | `AKAUNTING_ADMIN_EMAIL` / `AKAUNTING_ADMIN_PASSWORD` | `admin@akaunting.local` / generated | Akaunting admin login |
 | `AKAUNTING_COMPANY_NAME` / `AKAUNTING_COMPANY_EMAIL` | `My Company` / admin email | First company created |
 | `AKAUNTING_LOCALE` | `en-GB` | Install locale |
+| `AKAUNTING_APP_URL` | `http://<container-ip>:<AKAUNTING_PORT>`, or `https://<AKAUNTING_DOMAIN>` if `ENABLE_HTTPS=1` | Public URL Akaunting uses for links/redirects/emails — see [Putting it behind a reverse proxy](#putting-it-behind-a-reverse-proxy) |
 | `PG_ALLOWED_CIDR` | container's own `/24` | See [PostgreSQL access](#postgresql-access) |
+| `ENABLE_HTTPS` | `0` | Installs Caddy in the LXC with automatic Let's Encrypt HTTPS — see [Putting it behind a reverse proxy](#putting-it-behind-a-reverse-proxy) |
+| `AKAUNTING_DOMAIN` | — | Required if `ENABLE_HTTPS=1`; the public domain Caddy requests a certificate for |
+| `LETSENCRYPT_EMAIL` | — | Optional; contact address Let's Encrypt uses for renewal/expiry notices |
 
 All generated credentials (database and admin) are printed at the end of setup and saved to `/root/akaunting-credentials.txt` (root-only) inside the container.
 
@@ -72,6 +76,45 @@ Connect with, e.g.:
 psql "postgresql://akaunting:<password>@<container-ip>:5432/akaunting"
 ```
 
+## Putting it behind a reverse proxy
+
+Akaunting's container only speaks plain HTTP (there's no TLS toggle inside the app) — TLS termination is expected to happen in front of it, same as any other dockerized web app. Two ways to get there:
+
+### Option A: an existing reverse proxy (Nginx Proxy Manager, Traefik, ...)
+
+If you already run one, point it at `<container-ip>:<AKAUNTING_PORT>` and issue a certificate for your domain there as usual. The one thing to also do on this side: set `AKAUNTING_APP_URL` at install time to the HTTPS address clients will actually use (e.g. `AKAUNTING_APP_URL=https://accounting.example.com`), since Akaunting (Laravel) uses it to build absolute links, redirects, and the URLs in emails it sends — leaving it at the default `http://<container-ip>:<port>` means those come out wrong once you're accessing it through the proxy's domain instead.
+
+### Option B: self-contained HTTPS via Caddy (`ENABLE_HTTPS=1`)
+
+For a standalone deployment with no existing reverse proxy, set `ENABLE_HTTPS=1` and `AKAUNTING_DOMAIN=accounting.example.com` at install time:
+
+```bash
+ENABLE_HTTPS=1 AKAUNTING_DOMAIN=accounting.example.com LETSENCRYPT_EMAIL=you@example.com \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/trinityr/Akaunting-LXC/main/ct/akaunting.sh)"
+```
+
+This installs [Caddy](https://caddyserver.com/) directly in the LXC (a static binary, not dockerized) as a reverse proxy in front of the Akaunting container, and `AKAUNTING_APP_URL` automatically defaults to `https://accounting.example.com` so links/redirects/emails come out right without needing to set it separately.
+
+Caddy requests its certificate via Let's Encrypt's HTTP-01 challenge, which means `accounting.example.com` must already resolve to wherever this container is reachable from the internet, and ports 80/443 must actually reach it (port-forwarded through your router, if needed) — **before** the request happens. Since Let's Encrypt rate-limits failed attempts, the installer pauses right before requesting the certificate:
+
+```
+Caddy is configured for https://accounting.example.com but hasn't requested a certificate yet.
+Before continuing, make sure:
+  1. DNS for accounting.example.com resolves to wherever this container is reachable from the internet
+  2. Ports 80 and 443 reach this container (port-forwarded to <container-ip>, if needed)
+
+Press Enter to continue and request the certificate...
+```
+
+Get DNS and port-forwarding sorted, then press Enter. If it still fails (or you weren't at the terminal to see the pause — it's skipped automatically on a non-interactive run), Akaunting itself is unaffected; check `journalctl -u caddy -n 50 --no-pager` on the container, fix routing, and `systemctl restart caddy` to retry.
+
+If Akaunting is already installed and you're adding a reverse proxy (either option) afterward, the CLI installer only runs once, so there's no re-run to pick up a new `AKAUNTING_APP_URL`. Update it directly instead:
+
+```bash
+pct exec <CTID> -- docker exec akaunting sed -i "s#^APP_URL=.*#APP_URL=https://accounting.example.com#" /var/www/html/.env
+pct exec <CTID> -- docker restart akaunting
+```
+
 ## Console access
 
 By default, `pct console <CTID>` (and the Proxmox web console) drops you at a normal login prompt — no root password is set by this script, so you'd need to set one yourself (`pct exec <CTID> -- passwd`) to log in there.
@@ -89,7 +132,7 @@ Pulls the latest `akaunting/akaunting` image, rebuilds the local `pdo_pgsql` lay
 ## How it works
 
 - [`ct/akaunting.sh`](ct/akaunting.sh) — run on the Proxmox host. Creates the LXC (`pct create`/`pct start`) and hands off to the install script inside it, or drives an update against an existing container.
-- [`install/akaunting-install.sh`](install/akaunting-install.sh) — run inside the container. Installs Docker and PostgreSQL, creates the database/role, builds the `pdo_pgsql`-patched Akaunting image, and runs it.
+- [`install/akaunting-install.sh`](install/akaunting-install.sh) — run inside the container. Installs Docker and PostgreSQL, creates the database/role, builds the `pdo_pgsql`-patched Akaunting image, runs it, and (if `ENABLE_HTTPS=1`) installs Caddy as a reverse proxy with automatic Let's Encrypt HTTPS.
 
 Both scripts are self-contained (no dependency on other Proxmox helper-script frameworks) and safe to re-read before running, since they're fetched and executed via `curl | bash`.
 

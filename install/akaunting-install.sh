@@ -171,6 +171,7 @@ run_container() {
     -e "DB_PASSWORD=${AKAUNTING_DB_PASSWORD}" \
     -e DB_PREFIX=ak_ \
     -e "LOCALE=${AKAUNTING_LOCALE}" \
+    -e "APP_URL=${AKAUNTING_APP_URL}" \
     "${setup_args[@]}" \
     "$IMAGE_TAG" >/dev/null
   msg_ok "Started the Akaunting container"
@@ -190,6 +191,99 @@ wait_for_akaunting() {
     exit 1
   fi
   msg_ok "Akaunting is responding (HTTP ${code})"
+}
+
+install_caddy() {
+  msg_info "Installing Caddy"
+  curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy
+  chmod +x /usr/local/bin/caddy
+  msg_ok "Installed Caddy $(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}')"
+
+  getent group caddy >/dev/null || groupadd --system caddy
+  getent passwd caddy >/dev/null || useradd --system --gid caddy --home-dir /var/lib/caddy \
+    --no-create-home --shell /usr/sbin/nologin --comment "Caddy web server" caddy
+  mkdir -p /etc/caddy /var/lib/caddy
+  chown -R caddy:caddy /var/lib/caddy
+
+  msg_info "Writing Caddy config for ${AKAUNTING_DOMAIN}"
+  {
+    if [[ -n "$LETSENCRYPT_EMAIL" ]]; then
+      echo "{"
+      echo "    email ${LETSENCRYPT_EMAIL}"
+      echo "}"
+      echo
+    fi
+    echo "${AKAUNTING_DOMAIN} {"
+    echo "    reverse_proxy 127.0.0.1:${AKAUNTING_PORT}"
+    echo "}"
+  } >/etc/caddy/Caddyfile
+  msg_ok "Wrote /etc/caddy/Caddyfile"
+
+  cat <<'EOF' >/etc/systemd/system/caddy.service
+[Unit]
+Description=Caddy (Akaunting reverse proxy)
+Documentation=https://caddyserver.com/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=caddy
+Group=caddy
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# Requesting a certificate before DNS/port-forwarding is actually in place
+# just burns Let's Encrypt's rate limit on failed attempts, so pause here
+# (interactively - this is meant to be run while watching the terminal) and
+# let the operator confirm routing before Caddy makes its first request.
+confirm_https_ready() {
+  echo
+  echo "Caddy is configured for https://${AKAUNTING_DOMAIN} but hasn't requested a certificate yet."
+  echo "Before continuing, make sure:"
+  echo "  1. DNS for ${AKAUNTING_DOMAIN} resolves to wherever this container is reachable from the internet"
+  echo "  2. Ports 80 and 443 reach this container (port-forwarded to $(get_ip), if needed)"
+  echo
+  echo "Let's Encrypt rate-limits failed attempts, so it's worth confirming before Caddy requests anything."
+  if [[ -t 0 ]]; then
+    read -r -p "Press Enter to continue and request the certificate... " _
+  else
+    msg_info "Non-interactive shell - skipping the confirmation pause"
+  fi
+}
+
+wait_for_https() {
+  msg_info "Waiting for Caddy to obtain the certificate and respond over HTTPS"
+  # Connect straight to Caddy on localhost rather than the public domain:
+  # many home routers don't support NAT hairpinning (reaching your own
+  # public IP/domain from inside your own LAN), which would otherwise make
+  # this look like a failure even when the certificate and external access
+  # are both fine. --resolve still sends the right SNI/Host for Caddy to
+  # pick the site and for the cert's hostname to validate correctly.
+  local tries=0 code="000"
+  while [[ $tries -lt 30 ]]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "${AKAUNTING_DOMAIN}:443:127.0.0.1" "https://${AKAUNTING_DOMAIN}/" || true)
+    [[ "$code" != "000" ]] && break
+    sleep 5
+    tries=$((tries + 1))
+  done
+  if [[ "$code" == "000" ]]; then
+    msg_error "Caddy did not respond over HTTPS in time. Check: journalctl -u caddy -n 50 --no-pager"
+    msg_error "Akaunting itself is fine at http://$(get_ip):${AKAUNTING_PORT} - fix DNS/routing and 'systemctl restart caddy' once ready."
+  else
+    msg_ok "Caddy is responding over HTTPS (HTTP ${code})"
+  fi
 }
 
 setup_motd() {
@@ -259,8 +353,14 @@ print_summary() {
   local ip
   ip=$(get_ip)
 
+  local web_ui_line="Akaunting web UI : http://${ip}:${AKAUNTING_PORT} (direct)"
+  if [[ "$ENABLE_HTTPS" == "1" ]]; then
+    web_ui_line="${web_ui_line}, https://${AKAUNTING_DOMAIN} (via Caddy)"
+  fi
+
   cat <<EOF >"$CRED_FILE"
-Akaunting web UI : http://${ip}:${AKAUNTING_PORT}
+${web_ui_line}
+Akaunting APP_URL: ${AKAUNTING_APP_URL} (used for links/redirects/emails - update via a reinstall or by editing .env if you add a reverse proxy later)
 Admin login      : ${AKAUNTING_ADMIN_EMAIL} / ${AKAUNTING_ADMIN_PASSWORD}
 
 PostgreSQL host (from other machines) : ${ip}:5432
@@ -303,11 +403,31 @@ AKAUNTING_ADMIN_PASSWORD="${AKAUNTING_ADMIN_PASSWORD:-}"
 AKAUNTING_COMPANY_NAME="${AKAUNTING_COMPANY_NAME:-My Company}"
 AKAUNTING_COMPANY_EMAIL="${AKAUNTING_COMPANY_EMAIL:-$AKAUNTING_ADMIN_EMAIL}"
 AKAUNTING_LOCALE="${AKAUNTING_LOCALE:-en-GB}"
+AKAUNTING_APP_URL="${AKAUNTING_APP_URL:-}"
 PG_ALLOWED_CIDR="${PG_ALLOWED_CIDR:-}"
+ENABLE_HTTPS="${ENABLE_HTTPS:-0}"
+AKAUNTING_DOMAIN="${AKAUNTING_DOMAIN:-}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+
+if [[ "$ENABLE_HTTPS" == "1" && -z "$AKAUNTING_DOMAIN" ]]; then
+  msg_error "ENABLE_HTTPS=1 requires AKAUNTING_DOMAIN to be set (e.g. AKAUNTING_DOMAIN=accounting.example.com)."
+  exit 1
+fi
 
 [[ -z "$AKAUNTING_DB_PASSWORD" ]] && AKAUNTING_DB_PASSWORD="$(gen_secret)"
 [[ -z "$AKAUNTING_ADMIN_PASSWORD" ]] && AKAUNTING_ADMIN_PASSWORD="$(gen_secret)"
 [[ -z "$PG_ALLOWED_CIDR" ]] && PG_ALLOWED_CIDR="$(detect_default_cidr)"
+# Default assumes direct IP:port access, or the Caddy-fronted domain if
+# ENABLE_HTTPS=1. Override with whatever address an existing reverse proxy
+# (Nginx Proxy Manager, ...) presents to clients instead - Laravel uses this
+# for absolute links, redirects and email URLs.
+if [[ -z "$AKAUNTING_APP_URL" ]]; then
+  if [[ "$ENABLE_HTTPS" == "1" ]]; then
+    AKAUNTING_APP_URL="https://${AKAUNTING_DOMAIN}"
+  else
+    AKAUNTING_APP_URL="http://$(get_ip):${AKAUNTING_PORT}"
+  fi
+fi
 
 install_docker
 install_postgres
@@ -316,6 +436,14 @@ create_database
 build_image
 run_container true
 wait_for_akaunting
+
+if [[ "$ENABLE_HTTPS" == "1" ]]; then
+  install_caddy
+  confirm_https_ready
+  msg_info "Starting Caddy (requesting the certificate now)"
+  systemctl enable -q --now caddy
+  wait_for_https
+fi
 
 msg_info "Setting up welcome message"
 setup_motd
@@ -336,7 +464,11 @@ AKAUNTING_ADMIN_PASSWORD=${AKAUNTING_ADMIN_PASSWORD}
 AKAUNTING_COMPANY_NAME=${AKAUNTING_COMPANY_NAME}
 AKAUNTING_COMPANY_EMAIL=${AKAUNTING_COMPANY_EMAIL}
 AKAUNTING_LOCALE=${AKAUNTING_LOCALE}
+AKAUNTING_APP_URL=${AKAUNTING_APP_URL}
 PG_ALLOWED_CIDR=${PG_ALLOWED_CIDR}
+ENABLE_HTTPS=${ENABLE_HTTPS}
+AKAUNTING_DOMAIN=${AKAUNTING_DOMAIN}
+LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
 EOF
 chmod 600 "$STATE_FILE"
 
